@@ -17,6 +17,7 @@ export const METRICS = {
   claimQueueWaiting: 'claim_queue_waiting',
   claimQueueWait: 'claim_queue_wait_seconds',
   seatCacheRejections: 'seat_cache_rejections_total',
+  claimRetries: 'claim_retries_total',
 
   // errors (src/common/filters/all-exceptions.filter.ts)
   dbErrors: 'db_errors_total',

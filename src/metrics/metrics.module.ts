@@ -72,6 +72,11 @@ const metricProviders = [
     buckets: DURATION_BUCKETS,
   }),
   makeCounterProvider({
+    name: METRICS.claimRetries,
+    help: 'Hold/reserve/cancel requests whose database call hit a transient error (DB_UNAVAILABLE / SERVER_BUSY) and was retried, by action, the first error\'s reason, and outcome (recovered, exhausted)',
+    labelNames: ['action', 'reason', 'outcome'],
+  }),
+  makeCounterProvider({
     name: METRICS.seatCacheRejections,
     help: 'Hot-seat losers answered 409 from the in-memory seat cache without touching the database, by stage (before_queue, after_wait, after_timeout)',
     labelNames: ['stage'],

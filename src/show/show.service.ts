@@ -29,6 +29,7 @@ import {
   SemaphoreTimeoutError,
 } from '../common/concurrency/fifo-semaphore.js';
 import { SeatCache } from './seat-cache.js';
+import { classifyDbError, getPgCode } from '../common/errors/db-error.js';
 import { METRICS } from '../metrics/metric-names.js';
 
 /** A hold/reserve request after the controller has resolved the one idempotency key. */
@@ -80,34 +81,26 @@ export interface ReservationResult {
   seats: string[];
   amountPaise: number;
   kind: ClaimMode;
-  // when the hold lapses; null for a reservation, which is permanent
   heldUntil: Date | null;
   replay: boolean;
 }
 
-/** The `action` label on claim metrics: 'hold' or 'reserve'. */
 function actionLabel(mode: ClaimMode): string {
   return mode === 'HOLD' ? 'hold' : 'reserve';
 }
 
-/** Unique index on reservations (user_id, idempotency_key); see reservation.entity.ts. */
 const IDEMPOTENCY_CONSTRAINT = 'uq_reservations_user_idem';
 
-/**
- * How long a hold/reserve request may wait for a turn at the database. Shorter than the pool's
- * connectionTimeoutMillis (5000), so the wait ends here first, where the seat cache can still
- * answer a loser with 409 instead of the pool timing out into a 429.
- */
 const CLAIM_QUEUE_TIMEOUT_MS = 4000;
+
+const TRANSIENT_RETRY_BACKOFF_MS: [number, number][] = [
+  [50, 150],
+  [200, 400],
+];
+const TRANSIENT_RETRY_BUDGET_MS = 3000;
 
 @Injectable()
 export class ShowService {
-  /**
-   * Our own FIFO queue in front of the database, one slot per pooled connection. Unlike the
-   * pool's internal queue, a request that gets its turn here runs our code again, so it can
-   * re-check the seat cache and return 409 without using a connection. That lets a hot-seat
-   * storm drain from memory once the winner is known.
-   */
   private readonly claimGate: FifoSemaphore;
 
   constructor(
@@ -137,6 +130,8 @@ export class ShowService {
     private readonly cancelledCounter: Counter<string>,
     @InjectMetric(METRICS.seatsReleased)
     private readonly seatsReleasedCounter: Counter<string>,
+    @InjectMetric(METRICS.claimRetries)
+    private readonly claimRetries: Counter<string>,
     private readonly seatCache: SeatCache,
   ) {
     this.claimGate = new FifoSemaphore(
@@ -163,14 +158,10 @@ export class ShowService {
       });
 
       try {
-        // a bulk admin insert (up to MAX_SEATS_PER_SHOW seats) may take longer than the
-        // request-path statement timeout; this applies to this transaction only
         await manager.query(`SET LOCAL statement_timeout = '30s'`);
 
         const savedShow = await showRepo.save(show);
 
-        // every seat in one statement with two parameters, whatever the hall size (no per-entity
-        // ORM work, no bind-parameter limit); status uses the column default, AVAILABLE
         const seatMeta = manager.connection.getMetadata(Seat);
         const column = (property: string) =>
           seatMeta.findColumnWithPropertyName(property)!.databaseName;
@@ -180,7 +171,6 @@ export class ShowService {
           [savedShow.showId, seats],
         );
 
-        // the response is built from the input: every seat starts available
         const seatEntities = seats.map((seatNumber) =>
           seatRepo.create({
             seatNumber,
@@ -236,7 +226,6 @@ export class ShowService {
               throw new BadRequestException('Invalid input value');
           }
         }
-        // anything else (pool timeout, DB down, ...) is classified by AllExceptionsFilter
         throw error;
       }
     });
@@ -257,7 +246,6 @@ export class ShowService {
         throw new NotFoundException(`Show with ID ${id} not found`);
       }
 
-      // a full read of the seats is also a fresh view for the hot-seat cache
       this.seatCache.replaceShow(id, show.seats);
 
       return this.mapToResponseDto(show, show.seats);
@@ -274,7 +262,6 @@ export class ShowService {
           throw new BadRequestException('Invalid show ID format');
         }
       }
-      // anything else (pool timeout, DB down, ...) is classified by AllExceptionsFilter
       throw error;
     }
   }
@@ -291,9 +278,13 @@ export class ShowService {
 
     let row: CancelReservationRow;
     try {
-      const rows: CancelReservationRow[] = await this.dataSource.query(
-        'SELECT * FROM cancel_reservation($1, $2)',
-        [reservationId, userId],
+      const rows: CancelReservationRow[] = await this.withTransientRetry(
+        'cancel',
+        () =>
+          this.dataSource.query('SELECT * FROM cancel_reservation($1, $2)', [
+            reservationId,
+            userId,
+          ]),
       );
       row = rows[0];
     } catch (error) {
@@ -317,13 +308,14 @@ export class ShowService {
     const releasedSeats = row.released_seats ?? [];
     if (row.outcome === 'CANCELLED') {
       this.seatCache.release(showId, releasedSeats);
-      this.cancelledCounter.inc({ kind: row.kind === 'HOLD' ? 'hold' : 'reserve' });
+      this.cancelledCounter.inc({
+        kind: row.kind === 'HOLD' ? 'hold' : 'reserve',
+      });
       this.seatsReleasedCounter.inc(releasedSeats.length);
     }
     return { reservationId: String(reservationId), showId, releasedSeats };
   }
 
-  /** Temporarily locks free seats for the user (AVAILABLE -> HOLD); the hold lapses at held_until. */
   async hold(
     showId: number,
     request: ClaimRequest,
@@ -332,10 +324,6 @@ export class ShowService {
     return this.claimSeats('HOLD', showId, request, userId);
   }
 
-  /**
-   * Permanently reserves seats (-> RESERVED). Accepts seats that are free or that the user
-   * currently holds, so "hold then reserve" and "reserve directly" both work.
-   */
   async reserve(
     showId: number,
     request: ClaimRequest,
@@ -344,11 +332,6 @@ export class ShowService {
     return this.claimSeats('RESERVE', showId, request, userId);
   }
 
-  /**
-   * Holds or reserves seats with a single call to claim_seats(): one pooled connection, one
-   * round trip. The function does the per-user lock, idempotency check, per-user limit, seat
-   * locking and writes atomically; this method only validates, calls it, and maps the outcome.
-   */
   private async claimSeats(
     mode: ClaimMode,
     showId: number,
@@ -359,8 +342,6 @@ export class ShowService {
       throw new BadRequestException('Invalid show ID');
     }
 
-    // same endpoint + show + seats (in any order) => same hash; a key must always carry the same
-    // request, so reusing a hold's key on /reserve is rejected as a mismatch
     const requestHash = createHash('sha256')
       .update(`${mode}:${showId}:${[...seats].sort().join(',')}`)
       .digest('hex');
@@ -379,7 +360,6 @@ export class ShowService {
 
     const action = actionLabel(mode);
 
-    // Hot-seat losers are answered from memory once a winner is known: no slot, no database.
     this.rejectIfTakenByOther(showId, seats, userId, action, 'before_queue');
 
     let release: () => void;
@@ -389,8 +369,6 @@ export class ShowService {
       release = await this.claimGate.acquire(CLAIM_QUEUE_TIMEOUT_MS);
     } catch (error) {
       if (!(error instanceof SemaphoreTimeoutError)) throw error;
-      // Waited too long. If a winner was recorded meanwhile this is still a clean 409;
-      // otherwise the seats may really be free and the database is the bottleneck.
       this.rejectIfTakenByOther(showId, seats, userId, action, 'after_timeout');
       this.declinedCounter.inc({ reason: 'server_busy', action });
       throw new HttpException(
@@ -413,19 +391,20 @@ export class ShowService {
 
     let row: ClaimSeatsRow;
     try {
-      // a winner may have been recorded while this request was waiting for its turn
       this.rejectIfTakenByOther(showId, seats, userId, action, 'after_wait');
 
+      const claim = () =>
+        this.withTransientRetry(action, () =>
+          this.callClaimSeats(params, action),
+        );
       try {
-        row = await this.callClaimSeats(params, action);
+        row = await claim();
       } catch (error) {
         if (!this.isIdempotencyRace(error)) {
           throw this.toHttpError(error, action);
         }
-        // The same key was used for another request at the same moment and that request
-        // committed first. Calling again now returns REPLAY or IDEMPOTENCY_MISMATCH.
         try {
-          row = await this.callClaimSeats(params, action);
+          row = await claim();
         } catch (retryError) {
           throw this.toHttpError(retryError, action);
         }
@@ -447,7 +426,61 @@ export class ShowService {
     return result;
   }
 
-  /** 409 SEAT_TAKEN straight from memory when another user is known to hold or own a seat. */
+  private async withTransientRetry<T>(
+    action: string,
+    call: () => Promise<T>,
+  ): Promise<T> {
+    const startedAt = Date.now();
+    let firstReason: string | undefined;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const result = await call();
+        if (firstReason) {
+          this.claimRetries.inc({
+            action,
+            reason: firstReason,
+            outcome: 'recovered',
+          });
+        }
+        return result;
+      } catch (error) {
+        const kind = classifyDbError(error);
+        const transient =
+          kind === 'DB_UNAVAILABLE' ||
+          (kind === 'SERVER_BUSY' && getPgCode(error) !== '55P03');
+        const backoff = TRANSIENT_RETRY_BACKOFF_MS[attempt];
+        const elapsed = Date.now() - startedAt;
+        if (!transient || backoff === undefined) {
+          if (firstReason) {
+            this.claimRetries.inc({
+              action,
+              reason: firstReason,
+              outcome: 'exhausted',
+            });
+          }
+          throw error;
+        }
+        const delay = backoff[0] + Math.random() * (backoff[1] - backoff[0]);
+        if (elapsed + delay > TRANSIENT_RETRY_BUDGET_MS) {
+          if (firstReason) {
+            this.claimRetries.inc({
+              action,
+              reason: firstReason,
+              outcome: 'exhausted',
+            });
+          }
+          throw error;
+        }
+        firstReason ??= kind;
+        this.logger.warn(
+          { err: error, action, attempt: attempt + 1, reason: kind },
+          'transient database error, retrying',
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
   private rejectIfTakenByOther(
     showId: number,
     seats: string[],
@@ -542,7 +575,6 @@ export class ShowService {
     }
   }
 
-  /** 23505 on the (user_id, idempotency_key) unique index. */
   private isIdempotencyRace(error: unknown): boolean {
     if (!(error instanceof QueryFailedError)) return false;
     const pgError = error.driverError as { code?: string; constraint?: string };
@@ -551,7 +583,6 @@ export class ShowService {
     );
   }
 
-  /** Maps errors from the claim_seats() call to a deliberate HTTP response. */
   private toHttpError(error: unknown, action: string): Error {
     if (error instanceof HttpException) {
       return error;
@@ -560,7 +591,6 @@ export class ShowService {
     if (error instanceof QueryFailedError) {
       const pgError = error.driverError as { code?: string; message?: string };
       if (pgError?.code === '55P03') {
-        // NOWAIT on the seat gate: another in-flight request has one of these seats locked
         if (pgError.message?.includes('could not obtain lock on row')) {
           this.declinedCounter.inc({ reason: 'seat_taken', action });
           return this.conflict(
@@ -568,7 +598,6 @@ export class ShowService {
             'One or more of the requested seats are already taken',
           );
         }
-        // lock_timeout on the per-(show, user) advisory lock
         this.declinedCounter.inc({ reason: 'request_in_progress', action });
         return this.conflict(
           'REQUEST_IN_PROGRESS',
@@ -578,7 +607,6 @@ export class ShowService {
       if (pgError?.code?.startsWith('22')) {
         return new BadRequestException('Invalid reservation request');
       }
-      // seats.reserved_by -> users: the token is trusted without a lookup, so its user may not exist
       if (pgError?.code === '23503') {
         return new UnauthorizedException({
           statusCode: HttpStatus.UNAUTHORIZED,
@@ -589,8 +617,6 @@ export class ShowService {
       }
     }
 
-    // Infrastructure errors (pool timeout, DB down, ...) go to AllExceptionsFilter, which answers
-    // 429 + Retry-After; anything it can't classify is logged there as a 500.
     return error as Error;
   }
 
@@ -620,7 +646,6 @@ export class ShowService {
       name: show.name,
       seats: seatResponses,
       counts,
-      // available + held + confirmed == total_seats by construction: every seat maps to exactly one
       total_seats: seats.length,
       price_paise: Number(show.pricePaise),
       per_user_limit: show.perUserLimit,
@@ -629,7 +654,6 @@ export class ShowService {
     };
   }
 
-  /** HOLD only counts as held until held_until; after that the seat is free again. RESERVED never lapses. */
   private publicSeatStatus(seat: Seat, now: number): PublicSeatStatus {
     switch (seat.status) {
       case SeatStatus.RESERVED:
