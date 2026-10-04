@@ -1,9 +1,9 @@
-/** Names of every custom Prometheus metric, so providers and @InjectMetric() can't drift apart. */
 export const METRICS = {
   // HTTP, every route (src/metrics/http-metrics.ts)
   httpRequestsTotal: 'http_requests_total',
   httpRequestDuration: 'http_request_duration_seconds',
   httpRequestsInFlight: 'http_requests_in_flight',
+  httpResponsesByClass: 'http_responses_total',
 
   // booking outcomes (src/show/show.service.ts)
   reservationsConfirmed: 'reservations_confirmed_total',
@@ -32,7 +32,31 @@ export const METRICS = {
   dbPoolConnections: 'db_pool_connections',
 } as const;
 
-/** Latency buckets in seconds: 5ms .. 30s. */
+export const LABEL_VALUES = {
+  statusClass: ['2xx', '3xx', '4xx', '5xx'],
+  declineReason: [
+    'seat_taken',
+    'per_user_limit',
+    'idempotent_replay',
+    'idempotency_mismatch',
+    'request_in_progress',
+    'server_busy',
+  ],
+  claimAction: ['hold', 'reserve'],
+  retryAction: ['hold', 'reserve', 'cancel'],
+  dbErrorReason: [
+    'SERVER_BUSY',
+    'DB_UNAVAILABLE',
+    'INVALID_INPUT',
+    'CONFLICT',
+    'INVALID_REFERENCE',
+  ],
+  retryReason: ['DB_UNAVAILABLE', 'SERVER_BUSY'],
+  retryOutcome: ['recovered', 'exhausted'],
+  cacheStage: ['before_queue', 'after_wait', 'after_timeout'],
+  cancelKind: ['hold', 'reserve'],
+} as const;
+
 export const DURATION_BUCKETS = [
   0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30,
 ];

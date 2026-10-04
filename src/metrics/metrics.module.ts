@@ -6,12 +6,9 @@ import {
 } from '@willsoto/nestjs-prometheus';
 import { DURATION_BUCKETS, METRICS } from './metric-names.js';
 import { HttpMetrics } from './http-metrics.js';
+import { MetricsInitializer } from './metrics-initializer.js';
 import { SeatStateMetrics } from './seat-state-metrics.js';
 
-/**
- * Every custom Prometheus metric, in one place. Global, so any module (and the global exception
- * filter) can @InjectMetric() them. Served at /metrics by PrometheusModule (app.module.ts).
- */
 const metricProviders = [
   // HTTP, every route
   makeCounterProvider({
@@ -24,6 +21,11 @@ const metricProviders = [
     help: 'HTTP response time in seconds',
     labelNames: ['method', 'route', 'status_code'],
     buckets: DURATION_BUCKETS,
+  }),
+  makeCounterProvider({
+    name: METRICS.httpResponsesByClass,
+    help: 'HTTP responses by status class (2xx, 3xx, 4xx, 5xx); every class starts at 0, so a 5xx filter always exists',
+    labelNames: ['status_class'],
   }),
   makeGaugeProvider({
     name: METRICS.httpRequestsInFlight,
@@ -96,7 +98,12 @@ const metricProviders = [
 
 @Global()
 @Module({
-  providers: [...metricProviders, HttpMetrics, SeatStateMetrics],
+  providers: [
+    ...metricProviders,
+    HttpMetrics,
+    SeatStateMetrics,
+    MetricsInitializer,
+  ],
   exports: [...metricProviders, HttpMetrics],
 })
 export class MetricsModule {}
