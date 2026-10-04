@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs';
 import { APP_FILTER } from '@nestjs/core';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 import { requestId } from './common/logging/request-id.js';
+import { PoolWarmer } from './common/lifecycle/pool-warmer.js';
 
 @Module({
   imports: [
@@ -69,10 +70,10 @@ import { requestId } from './common/logging/request-id.js';
         logging: false,
         extra: {
           max: config.database.MAX_CONNECTIONS,
-          idleTimeoutMillis: 30000,
+          idleTimeoutMillis: 600_000,
           connectionTimeoutMillis: 5000,
           keepAlive: true,
-          keepAliveInitialDelayMillis: 10000,
+          keepAliveInitialDelayMillis: 10_000,
         },
       }),
     }),
@@ -83,8 +84,8 @@ import { requestId } from './common/logging/request-id.js';
     ShowModule,
   ],
   providers: [
-    // turns infrastructure errors (pool timeouts, DB down) into 429 instead of 500 on every route
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
+    PoolWarmer,
   ],
 })
 export class AppModule {}
