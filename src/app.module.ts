@@ -43,6 +43,7 @@ import { PoolWarmer } from './common/lifecycle/pool-warmer.js';
                   },
                 }
               : undefined,
+          redact: ['req.headers.authorization', 'req.headers["x-admin-key"]']
         },
       }),
     }),
@@ -56,12 +57,7 @@ import { PoolWarmer } from './common/lifecycle/pool-warmer.js';
         username: config.database.USERNAME,
         password: config.database.PASSWORD,
         database: config.database.DATABASE,
-        ssl: config.database.SSL
-          ? {
-              rejectUnauthorized: true,
-              ca: readFileSync(config.database.CERT_PATH, 'utf8'),
-            }
-          : undefined,
+        ssl: config.database.SSL,
         poolSize: config.database.MAX_CONNECTIONS,
         cache: true,
         autoLoadEntities: true,
@@ -71,7 +67,7 @@ import { PoolWarmer } from './common/lifecycle/pool-warmer.js';
         extra: {
           max: config.database.MAX_CONNECTIONS,
           idleTimeoutMillis: 600_000,
-          connectionTimeoutMillis: 5000,
+          connectionTimeoutMillis: 10_000,
           keepAlive: true,
           keepAliveInitialDelayMillis: 10_000,
         },
