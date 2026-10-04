@@ -13,6 +13,11 @@
  *             resend an earlier request's exact key and body (the graders' on-sale scenario)
  *   hot | spread | limit | idem   as above
  *   cancel    release flow: reserve -> someone else can't take it -> someone else can't cancel it
+ *   expiry    hold flow: hold -> others locked out -> owner converts one seat to a reservation ->
+ *             wait past held_until -> the other seat is free again (and re-bookable), the
+ *             reservation is not; cancelling the old hold resurrects nothing. Waits for the
+ *             server's hold TTL (SEAT_LOCK_EXPIRATION_MINUTES, default 10 min); set it low
+ *             (e.g. 0.5) on the server for a quick run. --max-wait caps the wait (default 15 min).
  *             -> the owner cancels (twice is harmless) -> the seat is re-bookable
  *
  * Flags: --url <base> (BASE_URL, else http://localhost:$PORT) | --admin-key <key> (ADMIN_KEY)
@@ -20,6 +25,7 @@
  *        --concurrency <open connections> (500) | --timeout <ms per request> (30000)
  *        --prefix <test-user prefix> (lt) | --style spec|current (spec) | --env <file> (.env)
  *        --db-check  also verify the tables directly (needs DB_* / DATABASE_URL; for local runs)
+ *        --max-wait <ms>  expiry mode: longest it will wait for a hold to expire (900000)
  *
  * Steps: admin token (POST /user/admin-token) -> test users + tokens (POST /user/test-tokens)
  * -> fresh show (POST /shows) -> /metrics snapshot -> fire every request at once
@@ -33,7 +39,7 @@ import { Client, type ClientConfig } from 'pg';
 import { Agent, setGlobalDispatcher } from 'undici';
 
 /* ------------------------------------------------------------------- types */
-type Mode = 'hot' | 'spread' | 'limit' | 'idem' | 'stampede' | 'cancel';
+type Mode = 'hot' | 'spread' | 'limit' | 'idem' | 'stampede' | 'cancel' | 'expiry';
 type Json = Record<string, any>;
 interface TestUser {
   id: number;
@@ -86,16 +92,18 @@ const { values: a } = parseArgs({
     limit: { type: 'string', default: '4' },
     seats: { type: 'string' },
     concurrency: { type: 'string', default: '500' },
-    timeout: { type: 'string', default: '120000' },
+    timeout: { type: 'string', default: '30000' },
     prefix: { type: 'string', default: 'lt' },
     'db-check': { type: 'boolean', default: false },
+    'max-wait': { type: 'string', default: '900000' },
     env: { type: 'string', default: '.env' },
   },
 });
 
 loadEnv(a.env as string);
 
-const MODES: Mode[] = ['hot', 'spread', 'limit', 'idem', 'stampede', 'cancel'];
+const MAX_WAIT_MS = Number(a['max-wait']);
+const MODES: Mode[] = ['hot', 'spread', 'limit', 'idem', 'stampede', 'cancel', 'expiry'];
 const N = Number(a.n);
 const MODE = a.mode as Mode;
 const LIMIT = Number(a.limit);
@@ -118,6 +126,8 @@ if (!['spec', 'current'].includes(a.style as string))
 if (!Number.isInteger(N) || N < 1) die('-n must be a positive integer');
 if (!Number.isInteger(CONCURRENCY) || CONCURRENCY < 1)
   die('--concurrency must be a positive integer');
+if (!Number.isInteger(TIMEOUT_MS) || TIMEOUT_MS < 1 || TIMEOUT_MS > 2_147_483_647)
+  die('--timeout must be a whole number of milliseconds, e.g. 30000');
 if (MODE === 'spread' && SEATS < N) die(`--seats must be >= ${N} for spread mode`);
 if (MODE === 'stampede' && SEATS < N + HOT_SEATS)
   die(`--seats must be >= ${N + HOT_SEATS} for stampede mode`);
@@ -169,12 +179,22 @@ async function call(
     const json = (await res.json().catch(() => ({}))) as Json; // empty body is fine
     return { status: res.status, json, ms: performance.now() - t0 };
   } catch (e) {
-    const err = e as { cause?: { code?: string }; name?: string };
+    // name/code plus the message (and the cause's), so failures are diagnosable from the output
+    const err = e as {
+      name?: string;
+      message?: string;
+      cause?: { code?: string; message?: string };
+    };
+    const kind = err.cause?.code ?? err.name ?? 'error';
+    const detail = [err.message, err.cause?.message]
+      .filter((m): m is string => Boolean(m))
+      .join(' | ')
+      .slice(0, 160);
     return {
       status: 0,
       json: {},
       ms: performance.now() - t0,
-      err: err.cause?.code ?? err.name ?? 'error',
+      err: detail ? `${kind}: ${detail}` : kind,
     };
   }
 }
@@ -360,7 +380,7 @@ async function runCancelScenario(admin: string): Promise<void> {
     price_paise: 25000,
     per_user_limit: LIMIT,
   });
-  if (created.status !== 201) die(`create show failed: ${describe(created)}, ${created.json}`);
+  if (created.status !== 201) die(`create show failed: ${describe(created)}`);
   const showId = Number(created.json.id ?? created.json.showId);
   console.log(`show ${showId} created with ${SEATS} seats`);
 
@@ -413,6 +433,115 @@ async function runCancelScenario(admin: string): Promise<void> {
   process.exit(fails.length ? 1 : 0);
 }
 
+/**
+ * --mode expiry: the hold lifecycle, step by step (not a burst). Waits past the hold's
+ * held_until, so it takes as long as the server's hold TTL.
+ */
+async function runExpiryScenario(admin: string): Promise<void> {
+  if (!Number.isInteger(MAX_WAIT_MS) || MAX_WAIT_MS < 0)
+    die('--max-wait must be a whole number of milliseconds');
+  const [a, b] = await testUsers(admin, 2);
+  const created = await call('POST', '/shows', admin, {
+    name: `burst-expiry-${Date.now()}`,
+    seats: Array.from({ length: SEATS }, (_, i) => `A${i + 1}`),
+    price_paise: 25000,
+    per_user_limit: LIMIT,
+  });
+  if (created.status !== 201) die(`create show failed: ${describe(created)}`);
+  const showId = Number(created.json.id ?? created.json.showId);
+  console.log(`show ${showId} created with ${SEATS} seats`);
+
+  const fails: string[] = [];
+  const step = (label: string, r: CallResult, want: number) => {
+    const okStep = r.status === want;
+    console.log(`  ${okStep ? 'ok  ' : 'FAIL'} ${label}: ${describe(r)} (want ${want})`);
+    if (!okStep) fails.push(`${label}: got ${describe(r)}, want ${want}`);
+    return r;
+  };
+  const claim = (endpoint: 'hold' | 'reserve', u: TestUser, seats: string[]) =>
+    call('POST', `/shows/${showId}/${endpoint}`, u.token, reserveBody(seats, newKey()));
+  const seatState = async () => {
+    const r = await call('GET', `/shows/${showId}`);
+    const seats = new Map(
+      ((r.json.seats ?? []) as Array<{ seat_number: string; status: string }>).map(
+        (x) => [x.seat_number, x.status],
+      ),
+    );
+    return { r, seats, counts: r.json.counts as Json | undefined };
+  };
+  const expectSeats = async (label: string, want: Record<string, string>) => {
+    const { seats, counts, r } = await seatState();
+    const got = Object.fromEntries(Object.keys(want).map((k) => [k, seats.get(k)]));
+    const match = Object.entries(want).every(([k, v]) => seats.get(k) === v);
+    const total = r.json.total_seats as number | undefined;
+    const reconciles =
+      !!counts && counts.available + counts.held + counts.confirmed === total;
+    console.log(
+      `  ${match && reconciles ? 'ok  ' : 'FAIL'} ${label}: ${JSON.stringify(got)} | counts ${JSON.stringify(counts)} | total_seats ${total}`,
+    );
+    if (!match) fails.push(`${label}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+    if (!reconciles) fails.push(`${label}: available + held + confirmed != total_seats`);
+    return match;
+  };
+
+  console.log('\n== while the hold is active ==');
+  const hold = step('A holds A1 + A2', await claim('hold', a, ['A1', 'A2']), 201);
+  const holdId = String(idOf(hold.json));
+  const heldUntil = Date.parse(String(hold.json.held_until));
+  if (hold.json.status !== 'held' || Number.isNaN(heldUntil))
+    fails.push(`hold response should have status "held" and held_until, got ${JSON.stringify(hold.json)}`);
+  await expectSeats('state after the hold', { A1: 'held', A2: 'held' });
+  step('B holds A1 (held by A)', await claim('hold', b, ['A1']), 409);
+  step('B reserves A2 (held by A)', await claim('reserve', b, ['A2']), 409);
+  step('A reserves A1 (own hold -> confirmed)', await claim('reserve', a, ['A1']), 201);
+  await expectSeats('state after A reserves A1', { A1: 'confirmed', A2: 'held' });
+
+  if (Number.isNaN(heldUntil)) return finishExpiry(fails);
+  const waitMs = heldUntil - Date.now() + 3000; // +3s for clock differences
+  if (waitMs > MAX_WAIT_MS)
+    die(
+      `the hold expires in ${Math.round(waitMs / 1000)}s, more than --max-wait ${Math.round(MAX_WAIT_MS / 1000)}s; lower SEAT_LOCK_EXPIRATION_MINUTES on the server or raise --max-wait`,
+    );
+  console.log(`\n== waiting ${Math.max(0, Math.round(waitMs / 1000))}s for the hold to expire (held_until ${new Date(heldUntil).toISOString()}) ==`);
+  for (let left = waitMs; left > 0; left -= 30_000) {
+    await new Promise((r) => setTimeout(r, Math.min(left, 30_000)));
+    if (left > 30_000) console.log(`  ${Math.round((left - 30_000) / 1000)}s left`);
+  }
+
+  console.log('\n== after the hold expired ==');
+  // poll briefly in case the server's clock is a little behind ours
+  let expired = false;
+  for (let i = 0; i < 10 && !expired; i++) {
+    const { seats } = await seatState();
+    expired = seats.get('A2') === 'available';
+    if (!expired) await new Promise((r) => setTimeout(r, 3000));
+  }
+  await expectSeats('expired hold is free, the reservation is not', {
+    A1: 'confirmed',
+    A2: 'available',
+  });
+  step('B reserves A2 (expired hold, re-bookable)', await claim('reserve', b, ['A2']), 201);
+  step('A reserves A2 (now B\'s)', await claim('reserve', a, ['A2']), 409);
+  const cancel = step(
+    "A cancels the old hold",
+    await call('POST', `/reservations/${holdId}/cancel`, a.token),
+    200,
+  );
+  if ((cancel.json.released_seats ?? []).length !== 0)
+    fails.push(
+      `cancelling the expired hold released ${JSON.stringify(cancel.json.released_seats)}; it must not touch A1 (now A's reservation) or A2 (now B's)`,
+    );
+  await expectSeats('final state', { A1: 'confirmed', A2: 'confirmed' });
+  return finishExpiry(fails);
+}
+
+function finishExpiry(fails: string[]): void {
+  const result = fails.length ? 'FAIL' : 'PASS';
+  console.log(fails.length ? `\nFAIL\n  - ${fails.join('\n  - ')}` : '\nPASS');
+  console.log(`SUMMARY mode=expiry result=${result}`);
+  process.exit(fails.length ? 1 : 0);
+}
+
 /** The requests to fire, per mode. */
 function buildJobs(): Job[] {
   const seat = (i: number) => `A${i + 1}`;
@@ -448,7 +577,8 @@ function buildJobs(): Job[] {
       }));
     }
     case 'cancel':
-      return []; // handled by runCancelScenario
+    case 'expiry':
+      return []; // handled by runCancelScenario / runExpiryScenario
     case 'stampede': {
       const hot = Math.max(HOT_SEATS, Math.round(N * 0.3));
       const retries = Math.round(N * 0.1);
@@ -486,6 +616,7 @@ async function main(): Promise<void> {
 
   const admin = await adminToken();
   if (MODE === 'cancel') return runCancelScenario(admin);
+  if (MODE === 'expiry') return runExpiryScenario(admin);
   const jobs = buildJobs();
   const userCount = Math.max(...jobs.map((j) => j.userIndex)) + 1;
   const users = await testUsers(admin, userCount);
