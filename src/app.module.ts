@@ -71,6 +71,8 @@ import { requestId } from './common/logging/request-id.js';
           max: config.database.MAX_CONNECTIONS,
           idleTimeoutMillis: 30000,
           connectionTimeoutMillis: 5000,
+          keepAlive: true,
+          keepAliveInitialDelayMillis: 10000,
         },
       }),
     }),

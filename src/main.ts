@@ -1,3 +1,8 @@
+import dns from 'dns';
+import net from 'net';
+dns.setDefaultResultOrder('ipv4first');
+net.setDefaultAutoSelectFamilyAttemptTimeout(2000);
+
 import './instrumentation.js';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module.js';

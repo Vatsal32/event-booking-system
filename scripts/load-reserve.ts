@@ -86,7 +86,7 @@ const { values: a } = parseArgs({
     limit: { type: 'string', default: '4' },
     seats: { type: 'string' },
     concurrency: { type: 'string', default: '500' },
-    timeout: { type: 'string', default: '60000' },
+    timeout: { type: 'string', default: '120000' },
     prefix: { type: 'string', default: 'lt' },
     'db-check': { type: 'boolean', default: false },
     env: { type: 'string', default: '.env' },
