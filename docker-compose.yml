@@ -1,0 +1,122 @@
+services:
+  db:
+    image: docker.io/postgres:18
+    container_name: postgres-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: booking
+      POSTGRES_DB: defaultdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    shm_size: 1024mb
+    command: >
+      postgres
+      -c max_connections=20
+      -c shared_buffers=256MB
+      -c idle_in_transaction_session_timeout=30s
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: "22"
+    image: event-booking:local
+    container_name: booking-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      LOG_LEVEL: info
+#      DB_HOST: db
+#      DB_PORT: "5432"
+#      DB_USERNAME: booking
+#      DB_PASSWORD: booking
+#      DB_DATABASE: booking
+#      DB_SSL: "false"            # local Postgres has no TLS
+      DB_CERT_PATH: "/app/ca.pem"
+      JWT_SECRET: ${JWT_SECRET:-local-dev-jwt-secret-change-me-0123456789}
+      ADMIN_KEY: ${ADMIN_KEY:-local-dev-admin-key-change-me-0123456789}
+      TRACEWAY_URL: http://localhost:4200
+      TRACEWAY_SECRET: TRACEWAY_TOKEN
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  traceway:
+    image: ghcr.io/tracewayapp/traceway:latest
+    ports:
+      - "4200:80"
+    environment:
+      CLICKHOUSE_SERVER: "clickhouse:9000"
+      CLICKHOUSE_DATABASE: "traceway"
+      CLICKHOUSE_USERNAME: "default"
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_TLS: "false"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5433"
+      POSTGRES_DATABASE: "traceway"
+      POSTGRES_USERNAME: "traceway"
+      POSTGRES_PASSWORD: traceway
+      POSTGRES_SSLMODE: "disable"
+      JWT_SECRET: change-this-to-a-secure-secret-at-least-32-chars
+    volumes:
+      - ./data/traceway-storage:/app/storage
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: traceway
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - ./data/clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: [ "CMD", "clickhouse-client", "--password", "clickhouse", "--query", "SELECT 1" ]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: docker.io/postgres:17
+    environment:
+      POSTGRES_USER: traceway
+      POSTGRES_PASSWORD: traceway
+      POSTGRES_DB: traceway
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./data/postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U traceway" ]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    restart: unless-stopped

@@ -1,0 +1,86 @@
+name: Burst test against the live URL
+
+# Runs ./burst.sh (the one-command on-sale stampede) against the deployed service, as public
+# proof that the real deployment was tested. Needs two repository secrets:
+#   BURST_BASE_URL   e.g. https://<app>.azurecontainerapps.io
+#   BURST_ADMIN_KEY  the deployment's ADMIN_KEY
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: 'Stampede size (requests)'
+        default: '2000'
+      hot_n:
+        description: 'Hot-seat storm size (users racing for one seat)'
+        default: '500'
+  # after every successful deployment
+  workflow_run:
+    workflows: ['Trigger auto deployment for event-bookings']
+    types: [completed]
+
+concurrency:
+  group: burst
+  cancel-in-progress: false
+
+jobs:
+  burst:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      BASE_URL: ${{ secrets.BURST_BASE_URL }}
+      ADMIN_KEY: ${{ secrets.BURST_ADMIN_KEY }}
+      N: ${{ github.event.inputs.n || '2000' }}
+      HOT_N: ${{ github.event.inputs.hot_n || '500' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies (pnpm pinned by packageManager)
+        run: |
+          corepack enable
+          corepack install
+          pnpm install --frozen-lockfile
+
+      - name: Check secrets
+        run: |
+          if [[ -z "$BASE_URL" || -z "$ADMIN_KEY" ]]; then
+            echo "::error::Set the BURST_BASE_URL and BURST_ADMIN_KEY repository secrets"
+            exit 1
+          fi
+
+      - name: Wait until the service is ready (a fresh revision may be starting)
+        run: |
+          for i in $(seq 1 36); do
+            if curl -fsS --max-time 10 "$BASE_URL/health/readiness" > /dev/null; then
+              echo "ready"; exit 0
+            fi
+            echo "not ready yet ($i/36), retrying in 5s"; sleep 5
+          done
+          echo "::error::$BASE_URL/health/readiness did not return 200 within 3 minutes"
+          exit 1
+
+      - name: Run ./burst.sh
+        run: ./burst.sh "$BASE_URL" 2>&1 | tee burst.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Burst test against the live URL"
+            echo
+            echo '```'
+            grep -E '^(SUMMARY|ALL PASS|SOME SCENARIOS FAILED)' burst.log || echo "no summary (see the burst.log artifact)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: burst-log
+          path: burst.log

@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.env
+.env.*
+data
+docs
+scripts
+coverage
+docker-compose.yml
+README.md
