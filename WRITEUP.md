@@ -4,14 +4,12 @@
 
 | What | Where |
 |------|-------|
-| Live service | <!-- TODO: https://<app>.azurecontainerapps.io --> |
-| Swagger UI | <!-- TODO: <live-url>/docs --> |
-| Prometheus metrics | <!-- TODO: <live-url>/metrics --> |
-| Health | <!-- TODO: <live-url>/health/liveness and <live-url>/health/readiness --> |
-| Burst test run against the live URL (GitHub Actions) | <!-- TODO: link to the latest "Burst test against the live URL" run --> |
-| Live logs under load (recording) | <!-- TODO: link to the screen recording --> |
-| Traces / metrics / logs UI (Traceway) | <!-- TODO: Traceway URL + read-only login, if exposed --> |
-| Repository | <!-- TODO: public GitHub repo URL --> |
+| Live service | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/) |
+| Swagger UI | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/docs](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/docs) |
+| Prometheus metrics | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/metrics](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/metrics) |
+| Health | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/health/liveness](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/health/liveness) |
+| Live logs under load (recording) | [Video Link (GDrive)](https://drive.google.com/file/d/1rVZ9gJ8ZP9rxxThr988gRFz7azIfAum9/view?usp=sharing) |
+| Repository | [https://github.com/Vatsal32/event-booking-system/](https://github.com/Vatsal32/event-booking-system/) |
 
 **Stack:**
 - NestJS on Fastify, TypeORM and PostgreSQL. A single database is the only system of record: no Redis and no queue.
@@ -136,10 +134,10 @@ I used Claude Code throughout as a pair-programmer and reviewer.
 - trusting the signed token instead of a per-request user lookup;
 - the per-user limit counting held + reserved seats; dropping unique show names; default limit 4;
 - deployment shape: one Container Apps replica, 10 database connections on a 15-connection free-tier database;
-- a 50,000-seat cap per show;
+- a 50,100-seat cap per show;
 - which audit findings to fix and which to leave.
 
-**Directed, implemented with AI:**
+**Implemented with AI:**
 - the `claim_seats()` / `cancel_reservation()` SQL functions and the move from TypeORM `save()` to one round trip per request;
 - the seat cache and FIFO claim queue;
 - the global exception filter and readiness behaviour;
@@ -147,6 +145,7 @@ I used Claude Code throughout as a pair-programmer and reviewer.
 - the API-only burst script and `burst.sh`;
 - the GitHub Actions burst workflow;
 - the Swagger and documentation passes.
+- these docs
 
 **Caught by testing, not by the AI:**
 - 500s under a 20k "spread" load against the remote database (pool exhaustion), which led to the one-round-trip redesign;
@@ -154,7 +153,7 @@ I used Claude Code throughout as a pair-programmer and reviewer.
 - connection resets caused by over-tight database timeouts;
 - a broken `docker-compose.yml` healthcheck.
 
-I ran the load tests, read the results, and pushed back on suggestions. For example, I questioned whether the claim queue (a semaphore) was really needed before accepting it.
+I ran the load tests, read the results, and pushed back on suggestions. For example, the claim queue (a semaphore) was required.
 
 ## 8. What I'd do next
 

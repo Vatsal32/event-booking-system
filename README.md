@@ -1,74 +1,100 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Seat Reservation at Scale
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+A JSON API that sells assigned seats for an event and stays correct under an on-sale stampede: **a seat is never sold twice, a user never exceeds their limit, a retried request never books twice, and declines are clean 4xx, never 5xx**. Built for the Paytm Money "Deploy & Observe" take-home.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
 
-## Description
+| What | Where |
+|------|-------|
+| Live service | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/) |
+| Swagger UI | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/docs](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/docs) |
+| Prometheus metrics | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/metrics](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/metrics) |
+| Health | [https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/health/liveness](https://event-bookings.purpleglacier-6241d065.centralindia.azurecontainerapps.io/health/liveness) |
+| Live logs under load (recording) | [Video Link (GDrive)](https://drive.google.com/file/d/1rVZ9gJ8ZP9rxxThr988gRFz7azIfAum9/view?usp=sharing) |
+| Design write-up | [`WRITEUP.md`](WRITEUP.md) |
+| Full technical documentation | [`docs/PROJECT_DOCUMENTATION.md`](docs/PROJECT_DOCUMENTATION.md) |
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## How it works (short version)
 
-## Project setup
+- **One atomic database call per booking.** Every hold or reserve is a single call to the PL/pgSQL function `claim_seats()` (`src/show/reserve-seats.sql.ts`), one implicit transaction:
+    1. a per-(show, user) advisory lock;
+    2. the idempotency check;
+    3. the per-user limit;
+    4. `SELECT … FOR UPDATE NOWAIT` on seats that are still free, in seat order;
+    5. the writes.
 
-```bash
-$ pnpm install
-```
+  Multi-seat requests are all-or-nothing. A loser never gets a second copy of a seat: it gets 409.
+- **Seat states:** `AVAILABLE` → `HOLD` (lapses at `held_until`) → `RESERVED` (permanent unless its owner cancels). `GET /shows/:id` reports them as `available` / `held` / `confirmed`, and `available + held + confirmed == total_seats` always holds.
+- **Idempotency:** a unique `(user_id, idempotency_key)` plus a hash of the request. A retry returns the original 201; the same key with a different body gets 409.
+- **Built for stampedes:**
+    - hot-seat losers are answered 409 from an in-memory seat cache;
+    - a FIFO claim queue protects the connection pool;
+    - transient database errors are retried (safe thanks to idempotency);
+    - any infrastructure failure becomes 429 with `Retry-After`, never a 500.
+- **Stack:** NestJS 12 on Fastify, TypeORM, PostgreSQL, Prometheus metrics (also pushed over OpenTelemetry to Traceway), pino structured logs with an `x-request-id` correlation id.
 
-## Compile and run the project
+## Run it locally
 
-```bash
-# development
-$ pnpm run start
-
-# watch mode
-$ pnpm run start:dev
-
-# production mode
-$ pnpm run start:prod
-```
-
-## Run tests
+Requirements: Node.js 24, pnpm (version pinned in `package.json`, `corepack enable` picks it up), Docker.
 
 ```bash
-# unit tests
-$ pnpm run test
+# 1. a local Postgres (from docker-compose.yml)
+docker compose up -d db
 
-# e2e tests
-$ pnpm run test:e2e
+# 2. configuration (see the table below)
+cat > .env <<'ENV'
+NODE_ENV=development
+PORT=8080
+JWT_SECRET=local-dev-jwt-secret-change-me-0123456789
+ADMIN_KEY=local-dev-admin-key-change-me-0123456789
+LOG_LEVEL=info
+DB_HOST=localhost
+DB_PORT=5432
+DB_USERNAME=booking
+DB_PASSWORD=booking
+DB_DATABASE=booking
+DB_SSL=
+DB_CERT_PATH=./ca.pem
+DB_MAX_CONNECTIONS=10
+SEAT_LOCK_EXPIRATION_MINUTES=10
+ENV
 
-# test coverage
-$ pnpm run test:cov
+# 3. install, build, start
+pnpm install
+pnpm build
+pnpm start:prod        # or: pnpm start:dev
 ```
+
+The tables are created on startup (TypeORM `synchronize`), and the `claim_seats()` / `cancel_reservation()` functions are installed automatically. Open `http://localhost:8080/docs` for Swagger, then run a burst against it:
+
+```bash
+ADMIN_KEY=local-dev-admin-key-change-me-0123456789 ./burst.sh http://localhost:8080
+```
+
+**Docker:** `docker build -t event-booking .`, then run it with the same environment variables (`-e …` or `--env-file .env`) and port `3000` (the image's `PORT`).
+
+### Configuration
+
+| Variable | Required | Default | Meaning |
+|----------|----------|---------|---------|
+| `NODE_ENV` | | `development` | `development` (pretty logs) or `production` (JSON logs) |
+| `PORT` | | `3000` | HTTP port |
+| `JWT_SECRET` | yes | | 32-256 characters; signs user and admin tokens |
+| `ADMIN_KEY` | yes | | 32-256 characters; exchanged for an admin token at `POST /user/admin-token` (`x-admin-key` header) |
+| `LOG_LEVEL` | | `DEBUG` | Set it explicitly, lowercase (`info`, `debug`, `warn`) |
+| `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_DATABASE` | yes | | PostgreSQL connection |
+| `DB_SSL` | yes (may be empty) | | Any non-empty value enables TLS. Set it but leave it **empty** (`DB_SSL=`) to disable: even the string `false` counts as enabled |
+| `DB_CERT_PATH` | yes | | CA certificate file for TLS (must be set even when TLS is off) |
+| `DB_MAX_CONNECTIONS` | yes | | Connection pool size (also the claim queue's slots). Keep it well below the database's `max_connections` |
+| `SEAT_LOCK_EXPIRATION_MINUTES` | | `10` | How long a hold lasts. Fractions allowed (`0.5` = 30s, handy for testing expiry) |
+| `TRACEWAY_URL`, `TRACEWAY_SECRET` | | `http://localhost:4200` | OpenTelemetry (OTLP) destination for traces, metrics and logs |
 
 ## Deployment
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+- **Platform:** Azure Container Apps, built and deployed by `.github/workflows/event-bookings-AutoDeployTrigger-*.yml` on every push to `main`.
+- **Shape:** one replica (the seat cache, the claim queue and the `/metrics` counters are per instance), with a pool of `DB_MAX_CONNECTIONS` connections to PostgreSQL. <!-- TODO: database provider/region, e.g. Neon (Azure <region>) -->
+- **Probes:** point the readiness probe at `/health/readiness`. It fails closed when the database is unreachable, stays ready when the database is merely busy, and returns 503 while shutting down.
+- **Shutdown is graceful:** in-flight requests finish, the pool closes and telemetry is flushed, within 25s.
+- **Burst test after each deploy:** `.github/workflows/burst.yml` runs `./burst.sh` against the live URL (secrets `BURST_BASE_URL`, `BURST_ADMIN_KEY`).
 
 ## Burst test (one command)
 
@@ -88,6 +114,7 @@ Each scenario runs on a fresh show and prints its outcome distribution (status +
 | `limit` | one user, 10 parallel reserves, `per_user_limit=4` | exactly 4 succeed |
 | `idem` | one user, the same idempotency key 50 times | one reservation, every response returns it |
 | `cancel` | reserve → another user tries the seat → another user tries to cancel → the owner cancels (twice) → the other user reserves | 409, 404, 200 (seat released), 200 (nothing released), 201: only the owner can cancel and a released seat is re-bookable |
+| `expiry` (opt-in: `EXPIRY=1`) | A holds A1+A2 → B is locked out → A reserves A1 → wait past `held_until` → B reserves A2 → A cancels the old hold | while held: 409 for B, A's own hold converts to a reservation; after expiry: A2 is `available` and re-bookable, A1 stays `confirmed`; the late cancel releases nothing. Waits for the server's hold TTL (`SEAT_LOCK_EXPIRATION_MINUTES`, default 10 min), so set it low (e.g. `0.5`) on the server for a quick run |
 
 All scenarios also check `available + held + confirmed == total_seats` and that no seat or idempotency key maps to more than one reservation. The script exits non-zero if anything failed. Sizes can be changed with `N`, `HOT_N`, `CONCURRENCY` and `TIMEOUT_MS`, e.g. `N=20000 ./burst.sh <url>`.
 
@@ -125,6 +152,7 @@ Metrics are served at **`GET /metrics`** (Prometheus text format). Scrapes thems
 |--------|------|--------|---------------|
 | `http_requests_total` | counter | `method`, `route`, `status_code` | Every response, by route template (e.g. `/shows/:id/reserve`) and status: 5xx, 409, 429 counts. |
 | `http_request_duration_seconds` | histogram | `method`, `route`, `status_code` | Response latency (p50/p95/p99). |
+| `http_responses_total` | counter | `status_class` (`2xx`, `3xx`, `4xx`, `5xx`) | Every response by status class. `5xx` exists (at 0) from startup, so a zero-5xx widget can filter on it. |
 | `http_requests_in_flight` | gauge | | Requests being processed right now. |
 | `reservations_confirmed_total` | counter | | Successful `POST /shows/:id/reserve`. |
 | `holds_created_total` | counter | | Successful `POST /shows/:id/hold`. |
@@ -140,6 +168,9 @@ Metrics are served at **`GET /metrics`** (Prometheus text format). Scrapes thems
 | `claim_queue_waiting` | gauge | | Hold/reserve requests waiting for a database slot. |
 | `claim_queue_wait_seconds` | histogram | `action` | How long they waited. |
 | `seat_cache_rejections_total` | counter | `stage` | Hot-seat losers answered 409 from memory without touching the database. |
+| `claim_retries_total` | counter | `action` (`hold`, `reserve`, `cancel`), `reason`, `outcome` (`recovered`, `exhausted`) | Database calls that hit a transient error (connection dropped, briefly overloaded) and were retried; `recovered` means the request still succeeded. |
+
+Labelled counters start with every label value at 0 (`src/metrics/metrics-initializer.ts`): every decline `reason` × `action`, every `status_class`, every retry `action` × `reason` × `outcome`, every cache `stage`, every cancel `kind`, and every `db_errors_total` `reason` (with `code="none"`). Dashboards can filter and group by them before the first event, and they read 0 until it happens.
 
 Default Node.js process metrics (CPU, memory, event-loop lag, ...) are exported too.
 
@@ -167,30 +198,23 @@ seats_total - (seats_available + seats_held + seats_confirmed)
 - 409 responses = `reservations_declined_total{action="reserve"}` for `seat_taken` + `per_user_limit` + `idempotency_mismatch` + `request_in_progress`.
 - `seats_confirmed{show_id}` = `counts.confirmed` from `GET /shows/:id`.
 
-## Resources
+## Project layout
 
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+```
+src/
+  show/            shows, holds, reservations, cancel; claim_seats()/cancel_reservation() SQL, seat cache
+  user/            register, login, admin token, test users for load tests
+  auth/            JWT strategy (token-only identity), roles guard
+  health/          liveness / readiness
+  metrics/         Prometheus metrics, HTTP hooks, seat-state gauges, OTLP bridge to Traceway
+  common/          global exception filter, DB error classification, request id, shutdown, pool warm-up
+  instrumentation.ts   OpenTelemetry SDK (traces, metrics, logs)
+scripts/load-reserve.ts  load / correctness scenarios (API only)
+burst.sh                 one-command burst against any URL
+WRITEUP.md               design write-up
+docs/PROJECT_DOCUMENTATION.md   full technical documentation
+```
 
 ## License
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+GPL-3.0, see [`LICENSE`](LICENSE).
