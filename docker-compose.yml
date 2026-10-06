@@ -54,7 +54,7 @@ services:
       JWT_SECRET: c16b578311ca0d0e122307b6f462085dfb66438969e8db6523e9562aa2a70623
       ADMIN_KEY: ${ADMIN_KEY:-local-dev-admin-key-change-me-0123456789}
       TRACEWAY_URL: http://traceway:80
-      TRACEWAY_SECRET: ${TRACEWAY_TOKEN:?set TRACEWAY_TOKEN in .env}
+      TRACEWAY_SECRET: ${TRACEWAY_SECRET:?set TRACEWAY_SECRET in .env}
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/readiness').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 10s
