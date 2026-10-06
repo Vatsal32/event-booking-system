@@ -10,7 +10,6 @@ import { HealthModule } from './health/health.module.js';
 import { PrometheusModule } from '@willsoto/nestjs-prometheus';
 import { MetricsModule } from './metrics/metrics.module.js';
 import { LifecycleModule } from './common/lifecycle/shutdown.service.js';
-import { readFileSync } from 'node:fs';
 import { APP_FILTER } from '@nestjs/core';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 import { requestId } from './common/logging/request-id.js';

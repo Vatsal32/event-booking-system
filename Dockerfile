@@ -21,7 +21,6 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 
-COPY ./ca.pem /app/ca.pem
 COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

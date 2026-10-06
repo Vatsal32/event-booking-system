@@ -36,11 +36,20 @@ A JSON API that sells assigned seats for an event and stays correct under an on-
 
 Requirements: Node.js 24, pnpm (version pinned in `package.json`, `corepack enable` picks it up), Docker.
 
-```bash
-# 1. a local Postgres (from docker-compose.yml)
-docker compose up -d db
+### With Traceway Observability (Recommended)
 
-# 2. configuration (see the table below)
+The stack includes Traceway for distributed tracing, metrics, and logs. To get the Traceway ingestion secret, you must start Traceway first, retrieve the token from its UI, then start the API.
+
+```bash
+# 1. Start infrastructure (PostgreSQL, Traceway, ClickHouse) — everything EXCEPT the API
+docker compose up -d db traceway clickhouse postgres
+
+# 2. Wait for Traceway to be ready, then open http://localhost:4200
+#    - Sign in / create an account if prompted
+#    - Go to Settings → Ingestion Tokens (or similar)
+#    - Copy the **Ingestion Secret / Token**
+
+# 3. Create .env with the Traceway secret
 cat > .env <<'ENV'
 NODE_ENV=development
 PORT=8080
@@ -52,13 +61,14 @@ DB_PORT=5432
 DB_USERNAME=booking
 DB_PASSWORD=booking
 DB_DATABASE=booking
-DB_SSL=
-DB_CERT_PATH=./ca.pem
+DB_SSL=false
 DB_MAX_CONNECTIONS=10
 SEAT_LOCK_EXPIRATION_MINUTES=10
+TRACEWAY_URL=http://localhost:4200
+TRACEWAY_SECRET=<paste-your-traceway-ingestion-secret-here>
 ENV
 
-# 3. install, build, start
+# 4. Install, build, and start the API
 pnpm install
 pnpm build
 pnpm start:prod        # or: pnpm start:dev
@@ -70,7 +80,44 @@ The tables are created on startup (TypeORM `synchronize`), and the `claim_seats(
 ADMIN_KEY=local-dev-admin-key-change-me-0123456789 ./burst.sh http://localhost:8080
 ```
 
-**Docker:** `docker build -t event-booking .`, then run it with the same environment variables (`-e …` or `--env-file .env`) and port `3000` (the image's `PORT`).
+### Without Traceway (Simpler)
+
+If you don't need Traceway observability, you can skip it entirely:
+
+```bash
+# 1. Start only the database
+docker compose up -d db
+
+# 2. Configuration (no TRACEWAY_* variables needed)
+cat > .env <<'ENV'
+NODE_ENV=development
+PORT=8080
+JWT_SECRET=local-dev-jwt-secret-change-me-0123456789
+ADMIN_KEY=local-dev-admin-key-change-me-0123456789
+LOG_LEVEL=info
+DB_HOST=localhost
+DB_PORT=5432
+DB_USERNAME=booking
+DB_PASSWORD=booking
+DB_DATABASE=booking
+DB_SSL=false
+DB_MAX_CONNECTIONS=10
+SEAT_LOCK_EXPIRATION_MINUTES=10
+ENV
+
+# 3. Install, build, start
+pnpm install
+pnpm build
+pnpm start:prod        # or: pnpm start:dev
+```
+
+**Docker (all-in-one, with Traceway):** After obtaining the Traceway secret and adding it to `.env`, you can run the full stack including the API:
+
+```bash
+docker compose up -d
+```
+
+The API will be available at `http://localhost:3000` (container port 3000) and Traceway at `http://localhost:4200`.
 
 ### Configuration
 
@@ -83,7 +130,6 @@ ADMIN_KEY=local-dev-admin-key-change-me-0123456789 ./burst.sh http://localhost:8
 | `LOG_LEVEL` | | `DEBUG` | Set it explicitly, lowercase (`info`, `debug`, `warn`) |
 | `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_DATABASE` | yes | | PostgreSQL connection |
 | `DB_SSL` | yes (may be empty) | | Any non-empty value enables TLS. Set it but leave it **empty** (`DB_SSL=`) to disable: even the string `false` counts as enabled |
-| `DB_CERT_PATH` | yes | | CA certificate file for TLS (must be set even when TLS is off) |
 | `DB_MAX_CONNECTIONS` | yes | | Connection pool size (also the claim queue's slots). Keep it well below the database's `max_connections` |
 | `SEAT_LOCK_EXPIRATION_MINUTES` | | `10` | How long a hold lasts. Fractions allowed (`0.5` = 30s, handy for testing expiry) |
 | `TRACEWAY_URL`, `TRACEWAY_SECRET` | | `http://localhost:4200` | OpenTelemetry (OTLP) destination for traces, metrics and logs |
